@@ -1,4 +1,4 @@
-name: pull-image
+name: docker-pull-and-save
 
 on:
   workflow_dispatch:
