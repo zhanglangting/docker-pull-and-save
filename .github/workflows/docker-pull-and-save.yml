@@ -1,0 +1,83 @@
+name: pull-image
+
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: '镜像（如 nginx:1.27 / library/redis:7）'
+        required: true
+        default: 'nginx:latest'
+      platform:
+        description: '目标平台'
+        type: choice
+        default: linux/amd64
+        options: [linux/amd64, linux/arm64, linux/arm/v7]
+      output_dir:
+        description: '存档输出目录（runner 内相对路径）'
+        required: true
+        default: 'images'
+      release_tag:
+        description: '可选：填了就发 Release，外部用户免登录下载'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  pull:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 生成 artifact 名称
+        id: k
+        env:
+          IMAGE: ${{ inputs.image }}
+          PLATFORM: ${{ inputs.platform }}
+        run: echo "safe=$(echo "${IMAGE}_${PLATFORM}" | tr '/:' '__')" >> "$GITHUB_OUTPUT"
+
+      - name: 清理磁盘
+        run: docker system prune -af || true; df -h /
+
+      - name: 下载镜像到指定目录
+        env:
+          IMAGE: ${{ inputs.image }}
+          PLATFORM: ${{ inputs.platform }}
+          OUTPUT_DIR: ${{ inputs.output_dir }}
+        run: |
+          chmod +x scripts/docker-pull-and-save.sh
+          ./scripts/docker-pull-and-save.sh "$IMAGE" "$PLATFORM" "$OUTPUT_DIR"
+          ls -lh "$OUTPUT_DIR"
+
+      - name: 上传 Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.k.outputs.safe }}
+          path: ${{ inputs.output_dir }}/*.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+      - name: 分卷（Release 单文件上限 2 GiB）
+        if: inputs.release_tag != ''
+        env:
+          OUTPUT_DIR: ${{ inputs.output_dir }}
+        run: |
+          mkdir -p rel
+          for f in "$OUTPUT_DIR"/*.tar.gz; do
+            if [ "$(stat -c%s "$f")" -gt 1900000000 ]; then
+              split -b 1900M "$f" "rel/$(basename "$f").part-"
+            else cp "$f" rel/; fi
+          done
+
+      - name: 发布 Release
+        if: inputs.release_tag != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.release_tag }}
+          IMAGE: ${{ inputs.image }}
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --notes "镜像: $IMAGE"
+          gh release upload "$TAG" rel/* --clobber
